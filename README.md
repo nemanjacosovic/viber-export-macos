@@ -49,11 +49,18 @@ Environment:
 ```
 
 A Viber window will briefly appear while the script captures the key, then it closes
-itself. Typical run time is 1–3 minutes (most of it copying the app bundle once).
+itself. Typical run time is 1–3 minutes. On APFS the app copy is an instant
+copy-on-write clone, so it takes no extra disk space.
+
+> **iCloud Drive:** if *Desktop & Documents Folders* is on in iCloud Drive, `~/Desktop`
+> (the default output) is uploaded to iCloud. The script detects this and asks before
+> writing there. To keep the decrypted chats on this Mac, use a local folder:
+> `./viber-export-macos.sh -o ~/viber-export`
 
 ## Output
 
-- **`viber_export.csv`** — one row per message:
+- **`viber_export.csv`** — UTF-8 with a BOM (so Excel/Numbers show Cyrillic, emoji, etc.
+  correctly), one row per message:
 
   | Column | Meaning |
   |---|---|
@@ -146,7 +153,9 @@ Every failure stops with a `[STOPPED]` message explaining **why** and **what to 
 | *Timed out before Viber unlocked its database* | Make sure Viber is **signed in** and online; complete any login/QR prompt, then re-run. |
 | *lldb was not allowed to launch/debug Viber* | Run `sudo DevToolsSecurity -enable`, then re-run. |
 | *Qt SQL interface does not match…* | Viber's Qt build changed — see [Caveat](#caveat--compatibility). |
-| *Viber is currently running* | Quit Viber (⌘Q) and re-run, or pass `-y` to proceed anyway. |
+| *Viber is currently running* | Quit Viber (⌘Q); the script waits up to 60 s for it to close. Or pass `-y` to proceed anyway. |
+| *Re-signing the Viber copy failed* | The message quotes codesign's error. Stray files in the `Viber.app` root (e.g. `manifest.md5`) and Finder xattrs are already stripped from the copy automatically. |
+| *output folder is synced to iCloud Drive* | Re-run with `-o` pointing at a local folder, e.g. `-o ~/viber-export`. |
 | *No `Messages` table…* | Your Viber schema differs; inspect `viber_plain.db` with `sqlite3 … .tables`. |
 
 When something goes wrong during the lldb phase, the script saves a **key-redacted**

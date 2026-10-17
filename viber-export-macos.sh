@@ -50,7 +50,7 @@ while getopts ":o:a:yh" opt; do
     o) OUT_DIR="$OPTARG" ;;
     a) VIBER_APP="$OPTARG" ;;
     y) ASSUME_YES=1 ;;
-    h) sed -n '2,40p' "$0"; exit 0 ;;
+    h) sed -n '2,37p' "$0"; exit 0 ;;
     *) echo "Usage: $0 [-o OUTPUT_DIR] [-a VIBER_APP] [-y]"; exit 2 ;;
   esac
 done
@@ -212,10 +212,33 @@ log "Database: $VIBER_DB"
 mkdir -p "$OUT_DIR" || stop "Cannot create output dir: $OUT_DIR" "Choose a writable location with -o."
 [[ -w "$OUT_DIR" ]] || stop "Output dir is not writable: $OUT_DIR" "Choose a writable location with -o."
 
+# With "Desktop & Documents Folders" enabled in iCloud Drive, ~/Desktop and ~/Documents
+# are uploaded to iCloud — which would send the decrypted chats off this Mac.
+OUT_REAL="$(cd "$OUT_DIR" && pwd -P)"
+ICLOUD_DRIVE="${HOME}/Library/Mobile Documents/com~apple~CloudDocs"
+in_icloud=0
+case "$OUT_REAL/" in "$ICLOUD_DRIVE"/*) in_icloud=1 ;; esac
+for _d in Desktop Documents; do
+  case "$OUT_REAL/" in "${HOME}/${_d}/"*) [[ -d "${ICLOUD_DRIVE}/${_d}" ]] && in_icloud=1 ;; esac
+done
+if [[ $in_icloud -eq 1 ]]; then
+  warn "The output folder is synced to iCloud Drive: $OUT_DIR"
+  warn "Your decrypted messages would be uploaded to iCloud."
+  if ! confirm "Write them there anyway? (choose N and re-run with -o ~/viber-export to keep them local)"; then
+    stop "Aborted so the decrypted chats are not uploaded to iCloud." \
+      "Re-run with a local output folder, e.g.:  $0 -o ~/viber-export"
+  fi
+fi
+
 # ------------------------------------------- shortcut: already plaintext? (older Viber)
 if is_plaintext_sqlite "$VIBER_DB"; then
   ok "This viber.db is already unencrypted — skipping decryption."
-  cp "$VIBER_DB" "$OUT_PLAIN" || stop "Failed to write $OUT_PLAIN" "Choose a writable location with -o."
+  # VACUUM INTO (not cp) so rows still sitting in viber.db-wal are included consistently;
+  # -readonly keeps the real viber.db untouched.
+  rm -f "$OUT_PLAIN"
+  _q=${OUT_PLAIN//\'/\'\'}
+  "$SQLITE" -readonly "$VIBER_DB" "VACUUM INTO '${_q}';" \
+    || stop "Failed to write $OUT_PLAIN" "Choose a writable location with -o."
   chmod 600 "$OUT_PLAIN" 2>/dev/null || true
   PLAIN_FOR_CSV="$OUT_PLAIN"
   SKIP_DECRYPT=1
@@ -237,6 +260,15 @@ if [[ "$SKIP_DECRYPT" -eq 0 ]]; then
         "Quit Viber (Cmd-Q), then re-run this script." \
         "Or re-run with -y to proceed anyway (reads are safe, but the running app may re-sync)."
     fi
+    if [[ $ASSUME_YES -eq 0 ]]; then
+      log "Waiting for Viber to quit (Cmd-Q it now)..."
+      _w=0
+      while pgrep -x Viber >/dev/null 2>&1 && [[ $_w -lt 60 ]]; do sleep 1; _w=$((_w + 1)); done
+      pgrep -x Viber >/dev/null 2>&1 && stop "Viber is still running after 60s." \
+        "Quit Viber (Cmd-Q), then re-run this script." \
+        "Or re-run with -y to proceed anyway."
+      ok "Viber has quit."
+    fi
   fi
 
   WORK="$(mktemp -d "${TMPDIR:-/tmp}/viberexp.XXXXXX")" || stop "Could not create a temp working directory." "Check disk space and permissions on \$TMPDIR."
@@ -254,8 +286,16 @@ if [[ "$SKIP_DECRYPT" -eq 0 ]]; then
       sleep 1; _i=$((_i+1))
     done
   }
-  cleanup() { stop_dbg; rm -rf "$WORK" 2>/dev/null || true; }
-  trap cleanup EXIT INT TERM
+  LLDB_PID=""
+  cleanup() {
+    [[ -n "$LLDB_PID" ]] && kill -KILL "$LLDB_PID" 2>/dev/null || true
+    stop_dbg; rm -rf "$WORK" 2>/dev/null || true
+  }
+  # A bare INT/TERM trap would run cleanup and then RESUME the script (with $WORK gone);
+  # exit explicitly so Ctrl-C actually stops it.
+  trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
   # On failure we point users at a debug log; copy it OUT of the temp dir (which cleanup
   # deletes) with any hexkey values redacted, so no key material is ever persisted.
@@ -274,7 +314,12 @@ if [[ "$SKIP_DECRYPT" -eq 0 ]]; then
   fi
 
   log "Making a temporary debuggable copy of Viber (your install is untouched)..."
-  cp -R "$VIBER_APP" "$DBG_APP" || stop "Failed to copy Viber.app into $WORK." "Check disk space and permissions."
+  # On APFS, -c makes an instant copy-on-write clone (no extra disk used); fall back to a
+  # normal copy when cloning isn't possible (e.g. TMPDIR on another volume).
+  if ! cp -Rc "$VIBER_APP" "$DBG_APP" 2>/dev/null; then
+    rm -rf "$DBG_APP"
+    cp -R "$VIBER_APP" "$DBG_APP" || stop "Failed to copy Viber.app into $WORK." "Check disk space and permissions."
+  fi
   cat > "${WORK}/ent.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -283,9 +328,15 @@ if [[ "$SKIP_DECRYPT" -eq 0 ]]; then
 </dict></plist>
 PLIST
   log "Ad-hoc re-signing the copy for debugging..."
+  # codesign refuses a bundle with anything but Contents/ in its root ("unsealed contents
+  # present in the bundle root") — some Viber installs ship e.g. a manifest.md5 there.
+  find "$DBG_APP" -mindepth 1 -maxdepth 1 ! -name Contents -exec rm -rf {} +
+  # Finder info / quarantine xattrs make codesign fail with "resource fork ... detritus".
+  xattr -cr "$DBG_APP" 2>/dev/null || true
   codesign --remove-signature "$DBG_APP" 2>/dev/null || true
-  if ! codesign --force --deep --sign - --entitlements "${WORK}/ent.plist" "$DBG_APP" >/dev/null 2>&1; then
+  if ! cs_err="$(codesign --force --deep --sign - --entitlements "${WORK}/ent.plist" "$DBG_APP" 2>&1)"; then
     stop "Re-signing the Viber copy failed (codesign error)." \
+      "codesign said: $(tail -n 3 <<< "$cs_err" | tr '\n' ' ')" \
       "Ensure Command Line Tools are installed:  xcode-select --install" \
       "Then re-run. If it persists, your Viber.app may be damaged — reinstall Viber."
   fi
@@ -534,7 +585,10 @@ fi
 MSG_ROWS="$("$SQLITE" "$PLAIN_FOR_CSV" "SELECT count(*) FROM Messages;" 2>/dev/null || echo '?')"
 log "Messages in database: $MSG_ROWS — writing CSV..."
 
-if ! "$SQLITE" -header -csv "$PLAIN_FOR_CSV" "
+# UTF-8 BOM first: without it Excel/Numbers show non-Latin text (Cyrillic, Greek, emoji…)
+# as mojibake.
+printf '\xEF\xBB\xBF' > "$OUT_CSV"
+if ! csv_err="$("$SQLITE" -header -csv "$PLAIN_FOR_CSV" 2>&1 >>"$OUT_CSV" "
 SELECT
   datetime(e.TimeStamp/1000,'unixepoch','localtime')                              AS DateTime,
   e.ChatID                                                                        AS ChatID,
@@ -547,8 +601,9 @@ FROM Events e
 JOIN Messages m ON m.EventID = e.EventID
 LEFT JOIN Contact c ON c.ContactID = e.ContactID
 WHERE m.Body IS NOT NULL AND m.Body <> ''
-ORDER BY e.TimeStamp ASC;" > "$OUT_CSV" 2>/dev/null; then
+ORDER BY e.TimeStamp ASC;")"; then
   stop "Failed while writing the CSV." \
+    "sqlite3 said: ${csv_err:-unknown error}" \
     "The plaintext DB is available at: $PLAIN_FOR_CSV — you can query it directly." \
     "Report the error with your Viber + macOS versions."
 fi
